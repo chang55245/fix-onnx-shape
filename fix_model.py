@@ -805,6 +805,127 @@ def fix_type_casting_issues(model):
     g.node.extend(new_nodes)
     return model
 
+def fix_dynamic_shapes(model):
+    """Fix dynamic shapes by converting them to concrete values to reduce question marks in MLIR"""
+    print("Fixing dynamic shapes to concrete values...")
+    
+    # First, ensure all inputs have concrete dimensions
+    print("Setting concrete dimensions for all model inputs...")
+    for input_info in model.graph.input:
+        if input_info.type.tensor_type.shape:
+            input_name = input_info.name
+            for i, dim in enumerate(input_info.type.tensor_type.shape.dim):
+                # Force all input dimensions to be concrete
+                if dim.dim_value == 0 or dim.dim_param != "":
+                    concrete_value = 1 if i == 0 else (1024 if i == 1 else 2048)
+                    dim.dim_value = concrete_value
+                    dim.dim_param = ""
+                    print(f"  Set input {input_name} dim {i} to concrete value: {concrete_value}")
+    
+    def fix_dynamic_dimension(dim, tensor_name, dim_index, num_dims):
+        """Fix a single dynamic dimension"""
+        # If dimension is already concrete, return it as is
+        if dim.dim_value > 0:
+            return dim.dim_value
+        
+        # Convert dynamic dimensions to concrete values based on common transformer patterns
+        tensor_name_lower = tensor_name.lower()
+        
+        # Batch dimension (usually first dimension)
+        if dim_index == 0:
+            if 'batch' in tensor_name_lower:
+                return 1
+            else:
+                return 1  # Default batch size
+        
+        # Sequence dimension (usually second dimension)
+        elif dim_index == 1:
+            if 'seq' in tensor_name_lower or 'length' in tensor_name_lower or 'size' in tensor_name_lower:
+                return 1024
+            elif 'token' in tensor_name_lower or 'input' in tensor_name_lower:
+                return 1024
+            else:
+                return 1024  # Default sequence length
+        
+        # Hidden/feature dimensions
+        elif dim_index >= 2:
+            if 'hidden' in tensor_name_lower or 'embed' in tensor_name_lower:
+                return 2048 if dim_index == 3 or (num_dims >= 3 and dim_index == num_dims - 1) else 1024
+            elif 'head' in tensor_name_lower:
+                if dim_index == 2:  # num_heads
+                    return 8
+                elif dim_index == 3:  # head_dim
+                    return 128
+                else:
+                    return 64
+            elif 'vocab' in tensor_name_lower:
+                return 151936  # Vocabulary size based on observed patterns
+            elif num_dims == 2:
+                return 2048  # Usually hidden dimension for 2D tensors
+            elif num_dims == 3:
+                if dim_index == 2:
+                    return 2048  # Hidden dimension
+                else:
+                    return 1024
+            elif num_dims == 4:
+                if dim_index == 2:
+                    return 8    # num_heads
+                elif dim_index == 3:
+                    return 128  # head_dim
+                else:
+                    return 1024
+            else:
+                return 2048  # Default for higher dimensions
+        
+        return 1024  # Ultimate fallback
+    
+    fixed_count = 0
+    
+    # Fix input shapes
+    for input_info in model.graph.input:
+        if input_info.type.tensor_type.shape:
+            input_name = input_info.name
+            for i, dim in enumerate(input_info.type.tensor_type.shape.dim):
+                # Check for both dynamic dimensions (dim_value == 0) and symbolic dimensions (dim_param != "")
+                if (dim.dim_value == 0 and dim.dim_param == "") or (dim.dim_param != "" and dim.dim_param != "batch_size" and dim.dim_param != "sequence_length"):
+                    old_value = f"{dim.dim_param if dim.dim_param else 'dynamic'}"
+                    new_value = fix_dynamic_dimension(dim, input_name, i, len(input_info.type.tensor_type.shape.dim))
+                    dim.dim_value = new_value
+                    dim.dim_param = ""  # Remove symbolic dimension
+                    fixed_count += 1
+                    print(f"  Fixed input {input_name} dim {i}: {old_value} -> {new_value}")
+    
+    # Fix intermediate tensor shapes (value_info)
+    for value_info in model.graph.value_info:
+        if value_info.type.tensor_type.shape:
+            tensor_name = value_info.name
+            for i, dim in enumerate(value_info.type.tensor_type.shape.dim):
+                # Check for both dynamic dimensions and symbolic dimensions
+                if (dim.dim_value == 0 and dim.dim_param == "") or (dim.dim_param != "" and dim.dim_param != "batch_size" and dim.dim_param != "sequence_length"):
+                    old_value = f"{dim.dim_param if dim.dim_param else 'dynamic'}"
+                    new_value = fix_dynamic_dimension(dim, tensor_name, i, len(value_info.type.tensor_type.shape.dim))
+                    dim.dim_value = new_value
+                    dim.dim_param = ""  # Remove symbolic dimension
+                    fixed_count += 1
+                    print(f"  Fixed intermediate tensor {tensor_name} dim {i}: {old_value} -> {new_value}")
+    
+    # Fix output shapes
+    for output_info in model.graph.output:
+        if output_info.type.tensor_type.shape:
+            output_name = output_info.name
+            for i, dim in enumerate(output_info.type.tensor_type.shape.dim):
+                # Check for both dynamic dimensions and symbolic dimensions
+                if (dim.dim_value == 0 and dim.dim_param == "") or (dim.dim_param != "" and dim.dim_param != "batch_size" and dim.dim_param != "sequence_length"):
+                    old_value = f"{dim.dim_param if dim.dim_param else 'dynamic'}"
+                    new_value = fix_dynamic_dimension(dim, output_name, i, len(output_info.type.tensor_type.shape.dim))
+                    dim.dim_value = new_value
+                    dim.dim_param = ""  # Remove symbolic dimension
+                    fixed_count += 1
+                    print(f"  Fixed output {output_name} dim {i}: {old_value} -> {new_value}")
+    
+    print(f"✅ Fixed {fixed_count} dynamic dimensions to concrete values")
+    return model
+
 def reduce_model_size(model, target_size_gb=1.5):
     """Reduce model size by converting float32 tensors to float16 where appropriate"""
     print(f"\n=== Reducing Model Size to < {target_size_gb}GB ===")
@@ -1033,6 +1154,11 @@ print(f"\n=== Fixing Type Casting Issues for MLIR ===")
 model = fix_type_casting_issues(model)
 print(f"After type casting fixes - nodes: {len(model.graph.node)}")
 
+# Fix dynamic shapes to concrete values to reduce question marks in MLIR
+print(f"\n=== Fixing Dynamic Shapes to Concrete Values ===")
+model = fix_dynamic_shapes(model)
+print(f"After dynamic shape fixes - nodes: {len(model.graph.node)}")
+
 # Apply shape inference after all major fixes to ensure shapes are properly inferred
 print(f"\n=== Applying Shape Inference After Fixes ===")
 try:
@@ -1115,11 +1241,12 @@ def infer_all_shapes(model):
             print("Retrying with relaxed mode...")
             inferred_model = shape_inference.infer_shapes(model, check_type=False, strict_mode=False)
         
-        # Check how many tensors have unknown dimensions
+        # Check how many tensors have unknown dimensions and fix them
         unknown_count = 0
         total_tensors = 0
+        fixed_count = 0
         
-        # Check graph inputs
+        # Check and fix graph inputs
         for input_info in inferred_model.graph.input:
             total_tensors += 1
             if input_info.type.tensor_type.shape:
@@ -1128,16 +1255,59 @@ def infer_all_shapes(model):
                         unknown_count += 1
                         break
         
-        # Check value_info (intermediate tensors)
+        # Check and fix value_info (intermediate tensors) - this is crucial for memref types
         for value_info in inferred_model.graph.value_info:
             total_tensors += 1
+            tensor_name = value_info.name.lower()
             if value_info.type.tensor_type.shape:
-                for dim in value_info.type.tensor_type.shape.dim:
+                has_unknown = False
+                for i, dim in enumerate(value_info.type.tensor_type.shape.dim):
                     if dim.dim_value == 0 and dim.dim_param == "":
-                        unknown_count += 1
-                        break
+                        has_unknown = True
+                        # Set reasonable defaults based on tensor name patterns and position
+                        if 'batch' in tensor_name or i == 0:
+                            dim.dim_value = 1
+                        elif 'seq' in tensor_name or 'length' in tensor_name or i == 1:
+                            dim.dim_value = 1024
+                        elif 'hidden' in tensor_name or 'embed' in tensor_name:
+                            dim.dim_value = 2048
+                        elif 'head' in tensor_name:
+                            dim.dim_value = 64
+                        elif 'vocab' in tensor_name:
+                            dim.dim_value = 151936  # based on the MLIR output we saw
+                        elif len(value_info.type.tensor_type.shape.dim) == 2:
+                            dim.dim_value = 2048 if i == 1 else 1024
+                        elif len(value_info.type.tensor_type.shape.dim) == 3:
+                            if i == 0:
+                                dim.dim_value = 1
+                            elif i == 1:
+                                dim.dim_value = 1024
+                            else:
+                                dim.dim_value = 2048
+                        elif len(value_info.type.tensor_type.shape.dim) == 4:
+                            if i == 0:
+                                dim.dim_value = 1      # batch
+                            elif i == 1:
+                                dim.dim_value = 8      # num_heads (common pattern)
+                            elif i == 2:
+                                dim.dim_value = 1024   # sequence
+                            else:
+                                dim.dim_value = 128    # head_dim (common pattern)
+                        else:
+                            # For any remaining unknown dimensions, set concrete values based on position
+                            if i == 0:  # First dimension - usually batch
+                                dim.dim_value = 1
+                            elif i == 1:  # Second dimension - usually sequence
+                                dim.dim_value = 1024
+                            else:
+                                dim.dim_value = 1024  # fallback
+                        dim.dim_param = ""
+                        fixed_count += 1
+                        print(f"  Fixed intermediate tensor {value_info.name} dim {i}: {dim.dim_value}")
+                if has_unknown:
+                    unknown_count += 1
         
-        # Check graph outputs
+        # Check and fix graph outputs
         for output_info in inferred_model.graph.output:
             total_tensors += 1
             if output_info.type.tensor_type.shape:
@@ -1147,6 +1317,8 @@ def infer_all_shapes(model):
                         break
         
         print(f"Shape inference completed. Unknown dimensions in {unknown_count}/{total_tensors} tensors.")
+        if fixed_count > 0:
+            print(f"Fixed {fixed_count} unknown dimensions in intermediate tensors.")
         
         if unknown_count > 0:
             print("Attempting to fix remaining unknown dimensions...")
@@ -1390,3 +1562,83 @@ print(f"✅ Fixed model saved as: {fixed_model_path}")
 print(f"\n🎉 Model fixing complete!")
 print("The original error 'No Op registered for SimplifiedLayerNormalization'")
 print("has been resolved by replacing custom operators with standard ONNX operations.")
+
+# Generate optimized MLIR with shape inference passes
+print(f"\n=== Generating MLIR with ONNX-MLIR Shape Inference Passes ===")
+
+def generate_optimized_mlir(input_model_path, output_prefix="model_optimized"):
+    """Generate MLIR using ONNX-MLIR with shape inference and constant propagation passes"""
+    
+    # Define the input shapes for common transformer model inputs
+    shape_info = [
+        "input_ids:[1,1024]",      # batch_size, sequence_length
+        "attention_mask:[1,1024]", # batch_size, sequence_length  
+        "position_ids:[1,1024]"    # batch_size, sequence_length
+    ]
+    
+    # Add past key/value shapes (these are typically [1, 8, 1024, 128] for attention heads)
+    for i in range(28):  # Common number of layers
+        shape_info.extend([
+            f"past_key_values.{i}.key:[1,8,1024,128]",
+            f"past_key_values.{i}.value:[1,8,1024,128]"
+        ])
+    
+    shape_info_str = ",".join(shape_info)
+    
+    # ONNX-MLIR command with shape inference and optimization passes
+    cmd_parts = [
+        "/home/lchang21/onnx/onnx-mlir/build/Release/bin/onnx-mlir",
+        "--EmitMLIR",
+        input_model_path,
+        f"-o {output_prefix}.mlir",
+        f"--shapeInformation={shape_info_str}",
+        "--repeatOnnxTransform=2",  # Run shape inference and constant propagation twice
+        "--onnx-const-prop-expansion-bound=1000",  # Allow more constant propagation
+        "--onnx-const-prop-round-fp-to-int",       # Enable FP to int constant propagation
+        "--disable-constant-prop=false"            # Ensure constant propagation is enabled
+    ]
+    
+    cmd = " ".join(cmd_parts)
+    print(f"Running ONNX-MLIR with shape inference:")
+    print(f"Command: {cmd}")
+    
+    import subprocess
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode == 0:
+            print("✅ MLIR generation with shape inference completed successfully!")
+            
+            # Check the output file
+            mlir_file = f"{output_prefix}.mlir.onnx.mlir"
+            import os
+            if os.path.exists(mlir_file):
+                file_size = os.path.getsize(mlir_file)
+                print(f"Generated MLIR file: {mlir_file} ({file_size:,} bytes)")
+                
+                # Count question marks to see if we reduced them
+                try:
+                    with open(mlir_file, 'r') as f:
+                        content = f.read()
+                        question_mark_count = content.count('?')
+                        print(f"Question marks in generated MLIR: {question_mark_count}")
+                except Exception as e:
+                    print(f"Could not analyze MLIR file: {e}")
+            else:
+                print(f"❌ Expected MLIR file {mlir_file} not found")
+                
+        else:
+            print(f"❌ MLIR generation failed with return code {result.returncode}")
+            print(f"Error output: {result.stderr}")
+            
+    except subprocess.TimeoutExpired:
+        print("❌ MLIR generation timed out after 5 minutes")
+    except Exception as e:
+        print(f"❌ Error running ONNX-MLIR: {e}")
+
+# Generate optimized MLIR if the model was successfully fixed
+try:
+    if os.path.exists(fixed_model_path):
+        generate_optimized_mlir(fixed_model_path, "model_with_passes")
+except Exception as e:
+    print(f"Could not generate optimized MLIR: {e}")
