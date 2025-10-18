@@ -1569,72 +1569,95 @@ print(f"\n=== Generating MLIR with ONNX-MLIR Shape Inference Passes ===")
 def generate_optimized_mlir(input_model_path, output_prefix="model_optimized"):
     """Generate MLIR using ONNX-MLIR with shape inference and constant propagation passes"""
     
-    # Define the input shapes for common transformer model inputs
+    # Start with basic shape information for the most important inputs
     shape_info = [
         "input_ids:[1,1024]",      # batch_size, sequence_length
         "attention_mask:[1,1024]", # batch_size, sequence_length  
         "position_ids:[1,1024]"    # batch_size, sequence_length
     ]
     
-    # Add past key/value shapes (these are typically [1, 8, 1024, 128] for attention heads)
-    for i in range(28):  # Common number of layers
-        shape_info.extend([
-            f"past_key_values.{i}.key:[1,8,1024,128]",
-            f"past_key_values.{i}.value:[1,8,1024,128]"
-        ])
-    
-    shape_info_str = ",".join(shape_info)
-    
-    # ONNX-MLIR command with shape inference and optimization passes
-    cmd_parts = [
-        "/home/lchang21/onnx/onnx-mlir/build/Release/bin/onnx-mlir",
-        "--EmitMLIR",
-        input_model_path,
-        f"-o {output_prefix}.mlir",
-        f"--shapeInformation={shape_info_str}",
-        "--repeatOnnxTransform=2",  # Run shape inference and constant propagation twice
-        "--onnx-const-prop-expansion-bound=1000",  # Allow more constant propagation
-        "--onnx-const-prop-round-fp-to-int",       # Enable FP to int constant propagation
-        "--disable-constant-prop=false"            # Ensure constant propagation is enabled
+    # Try different approaches in order of preference
+    approaches = [
+        {
+            "name": "Repeated transforms (most reliable)",
+            "args": [
+                "/home/lchang21/onnx/onnx-mlir/build/Release/bin/onnx-mlir",
+                "--EmitMLIR", 
+                input_model_path,
+                "-o", output_prefix,
+                "--repeatOnnxTransform=2"
+            ]
+        },
+        {
+            "name": "With constant propagation",
+            "args": [
+                "/home/lchang21/onnx/onnx-mlir/build/Release/bin/onnx-mlir",
+                "--EmitMLIR",
+                input_model_path,
+                "-o", output_prefix,
+                "--repeatOnnxTransform=2",
+                "--onnx-const-prop-expansion-bound=100"
+            ]
+        }
     ]
     
-    cmd = " ".join(cmd_parts)
-    print(f"Running ONNX-MLIR with shape inference:")
-    print(f"Command: {cmd}")
-    
     import subprocess
-    try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+    
+    for approach in approaches:
+        print(f"\nTrying approach: {approach['name']}")
         
-        if result.returncode == 0:
-            print("✅ MLIR generation with shape inference completed successfully!")
+        try:
+            # Use subprocess with proper argument handling
+            result = subprocess.run(
+                approach['args'],
+                capture_output=True, 
+                text=True, 
+                timeout=300
+            )
             
-            # Check the output file
-            mlir_file = f"{output_prefix}.mlir.onnx.mlir"
-            import os
-            if os.path.exists(mlir_file):
-                file_size = os.path.getsize(mlir_file)
-                print(f"Generated MLIR file: {mlir_file} ({file_size:,} bytes)")
+            if result.returncode == 0:
+                print(f"✅ MLIR generation with {approach['name']} completed successfully!")
                 
-                # Count question marks to see if we reduced them
-                try:
-                    with open(mlir_file, 'r') as f:
-                        content = f.read()
-                        question_mark_count = content.count('?')
-                        print(f"Question marks in generated MLIR: {question_mark_count}")
-                except Exception as e:
-                    print(f"Could not analyze MLIR file: {e}")
+                # Check the output file
+                mlir_file = f"{output_prefix}.onnx.mlir"
+                if os.path.exists(mlir_file):
+                    file_size = os.path.getsize(mlir_file)
+                    print(f"Generated MLIR file: {mlir_file} ({file_size:,} bytes)")
+                    
+                    # Count question marks to see if we reduced them
+                    try:
+                        with open(mlir_file, 'r') as f:
+                            content = f.read()
+                            question_mark_count = content.count('?')
+                            print(f"Question marks in generated MLIR: {question_mark_count}")
+                            
+                            # Check for specific memref patterns
+                            memref_dynamic = content.count('memref<?')
+                            if memref_dynamic > 0:
+                                print(f"Dynamic memref types: {memref_dynamic}")
+                            
+                        return True
+                    except Exception as e:
+                        print(f"Could not analyze MLIR file: {e}")
+                else:
+                    print(f"❌ Expected MLIR file {mlir_file} not found")
+                    continue
+                    
             else:
-                print(f"❌ Expected MLIR file {mlir_file} not found")
+                print(f"❌ {approach['name']} failed with return code {result.returncode}")
+                if result.stderr:
+                    print(f"Error: {result.stderr[:500]}...")  # Show first 500 chars
+                continue
                 
-        else:
-            print(f"❌ MLIR generation failed with return code {result.returncode}")
-            print(f"Error output: {result.stderr}")
-            
-    except subprocess.TimeoutExpired:
-        print("❌ MLIR generation timed out after 5 minutes")
-    except Exception as e:
-        print(f"❌ Error running ONNX-MLIR: {e}")
+        except subprocess.TimeoutExpired:
+            print(f"❌ {approach['name']} timed out after 5 minutes")
+            continue
+        except Exception as e:
+            print(f"❌ Error with {approach['name']}: {e}")
+            continue
+    
+    print("❌ All approaches failed")
+    return False
 
 # Generate optimized MLIR if the model was successfully fixed
 try:
