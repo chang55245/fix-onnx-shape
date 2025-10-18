@@ -29,6 +29,11 @@ def replace_simplified_layernorm(model):
         # Handle all outputs, not just the first one
         outputs = node.output
 
+        # Ensure input is cast to float for MLIR compatibility
+        inp_float = unique("inp_float")
+        cast_inp = helper.make_node("Cast", [inp], [inp_float], to=TensorProto.FLOAT)
+        new_nodes.append(cast_inp)
+
         eps = 1e-5
         for a in node.attribute:
             if a.name.lower() in ("eps", "epsilon"):
@@ -36,11 +41,11 @@ def replace_simplified_layernorm(model):
 
         # mean = ReduceMean(x, axes=[-1], keepdims=1)
         mean = unique("mean")
-        rm_mean = helper.make_node("ReduceMean", [inp], [mean], axes=[-1], keepdims=1)
+        rm_mean = helper.make_node("ReduceMean", [inp_float], [mean], axes=[-1], keepdims=1)
 
         # x_centered = x - mean
         centered = unique("centered")
-        sub = helper.make_node("Sub", [inp, mean], [centered])
+        sub = helper.make_node("Sub", [inp_float, mean], [centered])
 
         # var = ReduceMean(x_centered * x_centered, axes=[-1], keepdims=1)
         sq = unique("sq")
@@ -118,16 +123,26 @@ def replace_skip_simplified_layernorm(model):
         # Handle all outputs - SkipSimplifiedLayerNormalization has 4 outputs
         outputs = node.output
 
+        # Ensure inputs are cast to float for MLIR compatibility
+        inp_float = unique("inp_float")
+        cast_inp = helper.make_node("Cast", [inp], [inp_float], to=TensorProto.FLOAT)
+        new_nodes.append(cast_inp)
+
         # For now, implement as a simple residual connection
         # This is a simplified implementation - you may need to adjust based on your specific use case
         if skip:
+            # Also cast skip input to float
+            skip_float = unique("skip_float")
+            cast_skip = helper.make_node("Cast", [skip], [skip_float], to=TensorProto.FLOAT)
+            new_nodes.append(cast_skip)
+            
             # Add residual connection first
             residual = unique("residual")
-            add_skip = helper.make_node("Add", [inp, skip], [residual])
+            add_skip = helper.make_node("Add", [inp_float, skip_float], [residual])
             new_nodes.append(add_skip)
             current_input = residual
         else:
-            current_input = inp
+            current_input = inp_float
 
         # Apply the same layer norm logic as SimplifiedLayerNormalization
         eps = 1e-5
@@ -738,6 +753,58 @@ def fix_transpose_operations(model):
     g.node.extend(new_nodes)
     return model
 
+def fix_type_casting_issues(model):
+    """Fix type casting issues where uint8 tensors are used in operations expecting float types"""
+    g = model.graph
+    old_nodes = list(g.node)
+    new_nodes = []
+    
+    replaced = 0
+    
+    for node in old_nodes:
+        # Focus on the specific operations that MLIR mentioned in the error
+        if node.op_type in ['LayerNormalization', 'MatMul']:
+            # Only fix these specific operations that MLIR is complaining about
+            fixed_inputs = []
+            input_modified = False
+            
+            for inp in node.input:
+                # Check if this input might be problematic by looking at the name pattern
+                # or just cast all inputs to be safe for these critical operations
+                if 'quantized' in inp.lower() or True:  # Cast all inputs for LayerNorm and MatMul
+                    cast_output = unique(f"cast_{inp.replace('/', '_').replace('.', '_')}")
+                    cast_node = helper.make_node("Cast", [inp], [cast_output], to=TensorProto.FLOAT)
+                    fixed_inputs.append(cast_output)
+                    new_nodes.append(cast_node)
+                    input_modified = True
+                else:
+                    fixed_inputs.append(inp)
+            
+            if input_modified:
+                replaced += 1
+                # Recreate the node with cast inputs
+                new_node = helper.make_node(node.op_type, fixed_inputs, node.output)
+                
+                # Copy attributes from original node
+                for attr in node.attribute:
+                    new_node.attribute.append(attr)
+                
+                new_nodes.append(new_node)
+                print(f"  Fixed type casting for {node.op_type}: {node.name}")
+            else:
+                new_nodes.append(node)
+        else:
+            new_nodes.append(node)
+    
+    if replaced == 0:
+        print("⚠️  No type casting issues found.")
+    else:
+        print(f"✅ Fixed type casting for {replaced} operation(s) for MLIR compatibility.")
+
+    del g.node[:]
+    g.node.extend(new_nodes)
+    return model
+
 def reduce_model_size(model, target_size_gb=1.5):
     """Reduce model size by converting float32 tensors to float16 where appropriate"""
     print(f"\n=== Reducing Model Size to < {target_size_gb}GB ===")
@@ -952,6 +1019,11 @@ print(f"After Reshape fixes - nodes: {len(model.graph.node)}")
 print(f"\n=== Fixing Transpose Operations for MLIR ===")
 model = fix_transpose_operations(model)
 print(f"After Transpose fixes - nodes: {len(model.graph.node)}")
+
+# Fix type casting issues for MLIR compatibility
+print(f"\n=== Fixing Type Casting Issues for MLIR ===")
+model = fix_type_casting_issues(model)
+print(f"After type casting fixes - nodes: {len(model.graph.node)}")
 
 # Set IR version using the official ONNX constant to ensure compatibility
 print(f"\nSetting IR version from {model.ir_version} to {onnx.IR_VERSION}...")
